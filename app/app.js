@@ -6,9 +6,13 @@ const list = document.querySelector('[data-testid="incident-list"]');
 const loader = document.querySelector('[data-testid="loader"]');
 const empty = document.querySelector('[data-testid="empty"]');
 const error = document.querySelector('.error');
+const panel = document.querySelector('[data-testid="incident-panel"]');
+const panelAck = document.querySelector('[data-testid="panel-ack"]');
 
+const incidents = new Map(); // incident id -> incident, as last answered
 const acked = new Map(); // incident id -> ackedAt
-const pending = new Set(); // incident ids with an ack in flight
+let selectedId = null; // the incident the panel names; Ack only ever acks this id
+let acking = false;
 
 // R5: viewer's own zone and locale order (en-GB, de-DE, … put the day first).
 const timeFormat = new Intl.DateTimeFormat(navigator.languages?.[0] ?? navigator.language, {
@@ -18,6 +22,7 @@ const timeFormat = new Intl.DateTimeFormat(navigator.languages?.[0] ?? navigator
   hour: '2-digit',
   minute: '2-digit',
 });
+const localTime = (iso) => timeFormat.format(new Date(iso));
 
 function escape(s) {
   return String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
@@ -27,71 +32,97 @@ function rowHtml(i) {
   return `<span class="id">${escape(i.id)}</span>
     <span class="sev">${escape(i.severity)}</span>
     <span class="what">${escape(i.service)} · ${escape(i.region)} · ${escape(i.summary)}</span>
-    <time datetime="${escape(i.openedAt)}">${escape(timeFormat.format(new Date(i.openedAt)))}</time>
-    <span class="act"></span>`;
+    <time datetime="${escape(i.openedAt)}">${escape(localTime(i.openedAt))}</time>
+    <span class="state">${acked.has(i.id) ? '<span data-testid="acked" class="acked">✓ acked</span>' : ''}</span>`;
 }
 
-function renderAction(li) {
-  const id = li.dataset.id;
-  const slot = li.querySelector('.act');
-  if (acked.has(id)) {
-    if (!slot.querySelector('[data-testid="acked"]')) {
-      slot.innerHTML = '<span data-testid="acked" class="acked">✓ acked</span>';
-    }
-    li.classList.add('is-acked');
-  } else if (!slot.querySelector('[data-testid="ack"]')) {
-    slot.innerHTML = '<button type="button" data-testid="ack">Ack</button>';
+function paintRow(li, i) {
+  li.className = `row ${i.severity}${acked.has(i.id) ? ' is-acked' : ''}${i.id === selectedId ? ' is-selected' : ''}`;
+  li.setAttribute('aria-selected', String(i.id === selectedId));
+  const html = rowHtml(i);
+  if (li.dataset.html !== html) {
+    li.innerHTML = html;
+    li.dataset.html = html;
   }
-  const btn = slot.querySelector('[data-testid="ack"]');
-  if (btn) btn.disabled = pending.has(id);
 }
 
-// R1: keyed update, newest first; existing rows stay in the DOM, new ones go in above them.
-function render(incidents) {
-  const sorted = [...incidents].sort((a, b) => b.openedAt.localeCompare(a.openedAt));
-  const existing = new Map([...list.children].map((li) => [li.dataset.id, li]));
-  let prev = null;
-  for (const i of sorted) {
-    let li = existing.get(i.id);
-    if (!li) {
-      li = document.createElement('li');
-      li.dataset.testid = 'incident-row';
-      li.dataset.id = i.id;
-    }
-    existing.delete(i.id);
-    li.className = `row ${i.severity}`;
-    const html = rowHtml(i);
-    if (li.dataset.html !== html) {
-      li.innerHTML = html;
-      li.dataset.html = html;
-    }
-    renderAction(li);
-    const want = prev ? prev.nextSibling : list.firstChild;
-    if (want !== li) list.insertBefore(li, want);
-    prev = li;
+// R1: new incidents go in at the top, newest first. Rows already on the board are never moved or removed,
+// so the list only grows from the top.
+function render(page) {
+  const fresh = [];
+  for (const i of page.incidents) {
+    if (!incidents.has(i.id)) fresh.push(i);
+    incidents.set(i.id, i);
   }
-  for (const li of existing.values()) li.remove();
-  empty.hidden = sorted.length > 0;
+  fresh.sort((a, b) => a.openedAt.localeCompare(b.openedAt)); // oldest first, each prepended → newest on top
+  for (const i of fresh) {
+    const li = document.createElement('li');
+    li.dataset.testid = 'incident-row';
+    li.dataset.id = i.id;
+    li.tabIndex = 0;
+    li.setAttribute('role', 'option');
+    list.prepend(li);
+  }
+  for (const li of list.children) paintRow(li, incidents.get(li.dataset.id));
+  empty.hidden = incidents.size > 0;
+  renderPanel();
 }
 
-// R2: Ack the row that was clicked.
-list.addEventListener('click', async (e) => {
-  const btn = e.target.closest('[data-testid="ack"]');
-  if (!btn) return;
-  const li = btn.closest('[data-testid="incident-row"]');
-  const id = li.dataset.id;
-  if (pending.has(id) || acked.has(id)) return;
-  pending.add(id);
-  renderAction(li);
+// R2 (product, after step 1): a row opens its incident panel; Ack lives in the panel and acks the incident
+// the panel names, wherever that row has moved since.
+function renderPanel() {
+  const i = selectedId && incidents.get(selectedId);
+  panel.hidden = !i;
+  if (!i) return;
+  panel.querySelector('.p-id').textContent = i.id;
+  panel.querySelector('.p-sev').textContent = i.severity;
+  panel.querySelector('.p-sev').className = `p-sev ${i.severity}`;
+  panel.querySelector('.p-what').textContent = `${i.service} · ${i.region}`;
+  panel.querySelector('.p-summary').textContent = i.summary;
+  const t = panel.querySelector('.p-time');
+  t.dateTime = i.openedAt;
+  t.textContent = localTime(i.openedAt);
+  const done = acked.has(i.id);
+  panel.querySelector('.p-acked').hidden = !done;
+  panelAck.hidden = done;
+  panelAck.disabled = acking;
+  panelAck.textContent = acking ? 'Acking…' : `Ack ${i.id}`;
+}
+
+function select(id) {
+  if (acking) return;
+  selectedId = id;
+  for (const li of list.children) paintRow(li, incidents.get(li.dataset.id));
+  renderPanel();
+}
+
+list.addEventListener('click', (e) => {
+  const li = e.target.closest('[data-testid="incident-row"]');
+  if (li) select(li.dataset.id);
+});
+list.addEventListener('keydown', (e) => {
+  const li = e.target.closest('[data-testid="incident-row"]');
+  if (li && (e.key === 'Enter' || e.key === ' ')) {
+    e.preventDefault();
+    select(li.dataset.id);
+  }
+});
+panel.querySelector('.p-close').addEventListener('click', () => select(null));
+
+panelAck.addEventListener('click', async () => {
+  const id = selectedId;
+  if (!id || acking || acked.has(id)) return;
+  acking = true;
+  renderPanel();
   try {
     const reply = await ack(id);
-    acked.set(id, reply.ackedAt);
+    acked.set(reply.id, reply.ackedAt);
   } catch (err) {
     showError(err);
   } finally {
-    pending.delete(id);
-    const row = list.querySelector(`[data-testid="incident-row"][data-id="${CSS.escape(id)}"]`);
-    if (row) renderAction(row);
+    acking = false;
+    for (const li of list.children) paintRow(li, incidents.get(li.dataset.id));
+    renderPanel();
   }
 });
 
@@ -107,8 +138,7 @@ async function tick() {
   if (busy) return;
   busy = true;
   try {
-    const page = await fetchIncidents();
-    render(page.incidents);
+    render(await fetchIncidents());
     loader.remove();
     error.hidden = true;
   } catch (err) {
